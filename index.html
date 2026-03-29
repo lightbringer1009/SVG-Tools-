@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        import { useState, useRef, useEffect, useCallback } from "react";
+
+// ── Pattern generation algorithms ──────────────────────────────────
+
+function halftone(ctx, w, h, opts) {
+  const { shape = "circle", gridType = "square", spacing = 10, minSize = 1, maxSize = 5, angle = 0, invert = false } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+  const points = [];
+  const rad = (angle * Math.PI) / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+
+  const sample = (x, y) => {
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return 1;
+    const i = (iy * w + ix) * 4;
+    const lum = (imgData[i] * 0.299 + imgData[i+1] * 0.587 + imgData[i+2] * 0.114) / 255;
+    return invert ? lum : 1 - lum;
+  };
+
+  const s = spacing;
+  const rows = Math.ceil((w + h) / s) + 10;
+  const cols = Math.ceil((w + h) / s) + 10;
+
+  for (let r = -rows; r < rows; r++) {
+    for (let c = -cols; c < cols; c++) {
+      let gx, gy;
+      if (gridType === "hex" && r % 2 !== 0) {
+        gx = c * s + s * 0.5;
+        gy = r * s * 0.866;
+      } else if (gridType === "hex") {
+        gx = c * s;
+        gy = r * s * 0.866;
+      } else {
+        gx = c * s;
+        gy = r * s;
+      }
+      const px = gx * cos - gy * sin + w / 2;
+      const py = gx * sin + gy * cos + h / 2;
+      if (px < -s || px > w + s || py < -s || py > h + s) continue;
+      const brightness = sample(px, py);
+      const size = minSize + brightness * (maxSize - minSize);
+      if (size > 0.3) points.push({ x: px, y: py, size, shape });
+    }
+  }
+  return points;
+}
+
+function dither(ctx, w, h, opts) {
+  const { algorithm = "floyd-steinberg", pixelSize = 4, palette = "1bit" } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+  const gray = [];
+  for (let i = 0; i < d.length; i += 4) {
+    gray.push(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114);
+  }
+
+  const sw = Math.ceil(w / pixelSize), sh = Math.ceil(h / pixelSize);
+  const sampled = [];
+  for (let y = 0; y < sh; y++) {
+    sampled[y] = [];
+    for (let x = 0; x < sw; x++) {
+      const sx = Math.min(x * pixelSize, w - 1);
+      const sy = Math.min(y * pixelSize, h - 1);
+      sampled[y][x] = gray[sy * w + sx];
+    }
+  }
+
+  const levels = palette === "4level" ? [0, 85, 170, 255] : [0, 255];
+
+  const nearest = (v) => {
+    let best = levels[0], diff = Math.abs(v - levels[0]);
+    for (let i = 1; i < levels.length; i++) {
+      const d = Math.abs(v - levels[i]);
+      if (d < diff) { diff = d; best = levels[i]; }
+    }
+    return best;
+  };
+
+  if (algorithm === "ordered") {
+    const bayer4 = [[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const threshold = (bayer4[y % 4][x % 4] / 16) * 255;
+        sampled[y][x] = sampled[y][x] > threshold ? 255 : 0;
+      }
+    }
+  } else if (algorithm === "atkinson") {
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const old = sampled[y][x];
+        const nw = nearest(old);
+        sampled[y][x] = nw;
+        const err = (old - nw) / 8;
+        if (x+1 < sw) sampled[y][x+1] += err;
+        if (x+2 < sw) sampled[y][x+2] += err;
+        if (y+1 < sh) {
+          if (x-1 >= 0) sampled[y+1][x-1] += err;
+          sampled[y+1][x] += err;
+          if (x+1 < sw) sampled[y+1][x+1] += err;
+        }
+        if (y+2 < sh) sampled[y+2][x] += err;
+      }
+    }
+  } else {
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const old = sampled[y][x];
+        const nw = nearest(old);
+        sampled[y][x] = nw;
+        const err = old - nw;
+        if (x+1 < sw) sampled[y][x+1] += err * 7/16;
+        if (y+1 < sh) {
+          if (x-1 >= 0) sampled[y+1][x-1] += err * 3/16;
+          sampled[y+1][x] += err * 5/16;
+          if (x+1 < sw) sampled[y+1][x+1] += err * 1/16;
+        }
+      }
+    }
+  }
+
+  return { grid: sampled, sw, sh, pixelSize };
+}
+
+function crosshatch(ctx, w, h, opts) {
+  const { layers = 3, spacing = 6, strokeWidth = 1, angles = [0, 45, 90, 135] } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+  const lines = [];
+
+  const sample = (x, y) => {
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return 1;
+    const i = (iy * w + ix) * 4;
+    return (imgData[i] * 0.299 + imgData[i+1] * 0.587 + imgData[i+2] * 0.114) / 255;
+  };
+
+  const usedAngles = angles.slice(0, layers);
+  const thresholds = usedAngles.map((_, i) => (i + 1) / (usedAngles.length + 1));
+
+  usedAngles.forEach((angle, li) => {
+    const rad = (angle * Math.PI) / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    const diag = Math.sqrt(w * w + h * h);
+    const count = Math.ceil(diag / spacing);
+
+    for (let i = -count; i < count; i++) {
+      const offset = i * spacing;
+      const x1 = -diag / 2 * cos - offset * sin + w / 2;
+      const y1 = -diag / 2 * sin + offset * cos + h / 2;
+      const x2 = diag / 2 * cos - offset * sin + w / 2;
+      const y2 = diag / 2 * sin + offset * cos + h / 2;
+
+      const steps = 20;
+      const segments = [];
+      let inDark = false;
+      let sx = x1, sy = y1;
+
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const px = x1 + (x2 - x1) * t;
+        const py = y1 + (y2 - y1) * t;
+        const lum = sample(px, py);
+        const dark = lum < thresholds[li];
+
+        if (dark && !inDark) { sx = px; sy = py; inDark = true; }
+        else if (!dark && inDark) {
+          segments.push({ x1: sx, y1: sy, x2: px, y2: py });
+          inDark = false;
+        }
+      }
+      if (inDark) segments.push({ x1: sx, y1: sy, x2, y2 });
+      lines.push(...segments);
+    }
+  });
+
+  return { lines, strokeWidth };
+}
+
+function ascii(ctx, w, h, opts) {
+  const { cellSize = 8, charset = " .:-=+*#%@", invert = false } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+  const chars = [];
+  const cols = Math.floor(w / cellSize);
+  const rows = Math.floor(h / (cellSize * 1.6));
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const sx = c * cellSize, sy = r * cellSize * 1.6;
+      let sum = 0, count = 0;
+      for (let dy = 0; dy < cellSize * 1.6 && sy + dy < h; dy++) {
+        for (let dx = 0; dx < cellSize && sx + dx < w; dx++) {
+          const i = (Math.floor(sy + dy) * w + Math.floor(sx + dx)) * 4;
+          sum += imgData[i] * 0.299 + imgData[i+1] * 0.587 + imgData[i+2] * 0.114;
+          count++;
+        }
+      }
+      let lum = count > 0 ? sum / count / 255 : 1;
+      if (invert) lum = 1 - lum;
+      const idx = Math.min(Math.floor(lum * charset.length), charset.length - 1);
+      chars.push({ x: sx, y: sy + cellSize, ch: charset[idx] });
+    }
+  }
+  return { chars, cellSize };
+}
+
+function scanlines(ctx, w, h, opts) {
+  const { lineWidth = 2, gap = 2, opacity = 0.5, phosphor = false } = opts;
+  return { w, h, lineWidth, gap, opacity, phosphor };
+}
+
+function stipple(ctx, w, h, opts) {
+  const { count = 3000, dotSize = 2, relaxIterations = 3 } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+  const sample = (x, y) => {
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return 1;
+    const i = (iy * w + ix) * 4;
+    return 1 - (imgData[i] * 0.299 + imgData[i+1] * 0.587 + imgData[i+2] * 0.114) / 255;
+  };
+
+  let points = [];
+  let attempts = 0;
+  while (points.length < count && attempts < count * 20) {
+    const x = Math.random() * w, y = Math.random() * h;
+    if (Math.random() < sample(x, y)) points.push({ x, y });
+    attempts++;
+  }
+
+  for (let iter = 0; iter < relaxIterations; iter++) {
+    points = points.map(p => {
+      const r = 8;
+      let sx = 0, sy = 0, sw = 0;
+      for (let dy = -r; dy <= r; dy += 2) {
+        for (let dx = -r; dx <= r; dx += 2) {
+          const nx = p.x + dx, ny = p.y + dy;
+          const wt = sample(nx, ny);
+          sx += nx * wt; sy += ny * wt; sw += wt;
+        }
+      }
+      return sw > 0 ? { x: sx / sw, y: sy / sw } : p;
+    });
+  }
+
+  return { points, dotSize };
+}
+
+function concentricHalftone(ctx, w, h, opts) {
+  const { ringSpacing = 6, minStroke = 0.3, maxStroke = 4, cx, cy } = opts;
+  const imgData = ctx.getImageData(0, 0, w, h).data;
+  const centerX = cx ?? w / 2, centerY = cy ?? h / 2;
+  const maxR = Math.sqrt(centerX * centerX + centerY * centerY) + 50;
+
+  const sample = (x, y) => {
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= w || iy < 0 || iy >= h) return 0;
+    const i = (iy * w + ix) * 4;
+    return 1 - (imgData[i] * 0.299 + imgData[i+1] * 0.587 + imgData[i+2] * 0.114) / 255;
+  };
+
+  const rings = [];
+  for (let r = ringSpacing; r < maxR; r += ringSpacing) {
+    const samples = Math.max(36, Math.floor(2 * Math.PI * r / 4));
+    let avgBrightness = 0;
+    for (let i = 0; i < samples; i++) {
+      const angle = (i / samples) * Math.PI * 2;
+      avgBrightness += sample(centerX + Math.cos(angle) * r, centerY + Math.sin(angle) * r);
+    }
+    avgBrightness /= samples;
+    const sw = minStroke + avgBrightness * (maxStroke - minStroke);
+    rings.push({ r, strokeWidth: sw, cx: centerX, cy: centerY });
+  }
+  return { rings };
+}
+
+function guilloche(w, h, opts) {
+  const { majorR = 100, minorR = 60, penOffset = 40, rotations = 20, layers = 3 } = opts;
+  const paths = [];
+  for (let l = 0; l < layers; l++) {
+    const points = [];
+    const steps = rotations * 360;
+    const rOff = l * 15;
+    for (let i = 0; i <= steps; i++) {
+      const t = (i / steps) * rotations * Math.PI * 2;
+      const R = majorR + l * 8;
+      const r = minorR + rOff;
+      const d = penOffset + l * 5;
+      const x = (R - r) * Math.cos(t) + d * Math.cos(((R - r) / r) * t) + w / 2;
+      const y = (R - r) * Math.sin(t) - d * Math.sin(((R - r) / r) * t) + h / 2;
+      points.push({ x, y });
+    }
+    paths.push(points);
+  }
+  return { paths };
+}
+
+function truchet(w, h, opts) {
+  const { tileSize = 30, style = "quarter-circle" } = opts;
+  const cols = Math.ceil(w / tileSize), rows = Math.ceil(h / tileSize);
+  const tiles = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const rotation = Math.floor(Math.random() * 4) * 90;
+      tiles.push({ x: c * tileSize, y: r * tileSize, size: tileSize, rotation, style });
+    }
+  }
+  return { tiles };
+}
+
+function lissajous(w, h, opts) {
+  const { freqA = 3, freqB = 2, phase = 90, amplitude = 0.9, points: numPts = 2000, decay = 0 } = opts;
+  const points = [];
+  const phaseRad = (phase * Math.PI) / 180;
+  for (let i = 0; i <= numPts; i++) {
+    const t = (i / numPts) * Math.PI * 2 * Math.max(freqA, freqB);
+    const decayFactor = decay > 0 ? Math.exp(-decay * i / numPts) : 1;
+    const x = Math.sin(freqA * t + phaseRad) * amplitude * (w / 2) * decayFactor + w / 2;
+    const y = Math.sin(freqB * t) * amplitude * (h / 2) * decayFactor + h / 2;
+    points.push({ x, y });
+  }
+  return { points };
+}
+
+function moire(w, h, opts) {
+  const { spacing1 = 8, spacing2 = 9, angle1 = 0, angle2 = 5 } = opts;
+  return { w, h, spacing1, spacing2, angle1, angle2 };
+}
+
+// ── SVG generation ──────────────────────────────────
+
+function halftoneToSVG(data, w, h, color) {
+  let paths = "";
+  for (const p of data) {
+    if (p.shape === "circle") {
+      paths += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${p.size.toFixed(2)}" fill="${color}"/>`;
+    } else if (p.shape === "square") {
+      paths += `<rect x="${(p.x - p.size).toFixed(1)}" y="${(p.y - p.size).toFixed(1)}" width="${(p.size * 2).toFixed(2)}" height="${(p.size * 2).toFixed(2)}" fill="${color}"/>`;
+    } else if (p.shape === "diamond") {
+      const s = p.size;
+      paths += `<polygon points="${p.x.toFixed(1)},${(p.y-s).toFixed(1)} ${(p.x+s).toFixed(1)},${p.y.toFixed(1)} ${p.x.toFixed(1)},${(p.y+s).toFixed(1)} ${(p.x-s).toFixed(1)},${p.y.toFixed(1)}" fill="${color}"/>`;
+    } else if (p.shape === "line") {
+      paths += `<line x1="${(p.x - p.size).toFixed(1)}" y1="${p.y.toFixed(1)}" x2="${(p.x + p.size).toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="${color}" stroke-width="${Math.max(0.5, p.size * 0.4).toFixed(2)}"/>`;
+    } else if (p.shape === "cross") {
+      const s = p.size;
+      paths += `<line x1="${(p.x-s).toFixed(1)}" y1="${p.y.toFixed(1)}" x2="${(p.x+s).toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="${color}" stroke-width="${Math.max(0.5,s*0.3).toFixed(2)}"/>`;
+      paths += `<line x1="${p.x.toFixed(1)}" y1="${(p.y-s).toFixed(1)}" x2="${p.x.toFixed(1)}" y2="${(p.y+s).toFixed(1)}" stroke="${color}" stroke-width="${Math.max(0.5,s*0.3).toFixed(2)}"/>`;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${paths}</svg>`;
+}
+
+function ditherToSVG(data, w, h, color) {
+  let rects = "";
+  const { grid, sw, sh, pixelSize } = data;
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      const v = Math.max(0, Math.min(255, grid[y][x]));
+      if (v < 128) {
+        rects += `<rect x="${x * pixelSize}" y="${y * pixelSize}" width="${pixelSize}" height="${pixelSize}" fill="${color}"/>`;
+      }
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${sw * pixelSize} ${sh * pixelSize}" width="${sw * pixelSize}" height="${sh * pixelSize}"><rect width="100%" height="100%" fill="white"/>${rects}</svg>`;
+}
+
+function crosshatchToSVG(data, w, h, color) {
+  let lines = "";
+  for (const l of data.lines) {
+    lines += `<line x1="${l.x1.toFixed(1)}" y1="${l.y1.toFixed(1)}" x2="${l.x2.toFixed(1)}" y2="${l.y2.toFixed(1)}" stroke="${color}" stroke-width="${data.strokeWidth}" stroke-linecap="round"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${lines}</svg>`;
+}
+
+function asciiToSVG(data, w, h, color) {
+  let texts = "";
+  for (const c of data.chars) {
+    if (c.ch !== " ") {
+      const escaped = c.ch === "&" ? "&amp;" : c.ch === "<" ? "&lt;" : c.ch === ">" ? "&gt;" : c.ch === '"' ? "&quot;" : c.ch;
+      texts += `<text x="${c.x}" y="${c.y}" font-family="monospace" font-size="${data.cellSize}px" fill="${color}">${escaped}</text>`;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${texts}</svg>`;
+}
+
+function scanlinesToSVG(data, color) {
+  const { w, h, lineWidth: lw, gap, opacity, phosphor } = data;
+  let lines = "";
+  for (let y = 0; y < h; y += lw + gap) {
+    lines += `<rect x="0" y="${y}" width="${w}" height="${lw}" fill="${color}" opacity="${opacity}"/>`;
+  }
+  if (phosphor) {
+    for (let x = 0; x < w; x += 3) {
+      const colors = ["#ff0000", "#00ff00", "#0000ff"];
+      lines += `<rect x="${x}" y="0" width="1" height="${h}" fill="${colors[x % 3 === 0 ? 0 : x % 3 === 1 ? 1 : 2]}" opacity="0.08"/>`;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${lines}</svg>`;
+}
+
+function stippleToSVG(data, w, h, color) {
+  let dots = "";
+  for (const p of data.points) {
+    dots += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${data.dotSize}" fill="${color}"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${dots}</svg>`;
+}
+
+function concentricToSVG(data, w, h, color) {
+  let circles = "";
+  for (const ring of data.rings) {
+    circles += `<circle cx="${ring.cx.toFixed(1)}" cy="${ring.cy.toFixed(1)}" r="${ring.r.toFixed(1)}" fill="none" stroke="${color}" stroke-width="${ring.strokeWidth.toFixed(2)}"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${circles}</svg>`;
+}
+
+function guillocheToSVG(data, w, h, color) {
+  let paths = "";
+  const colors = [color, color + "99", color + "55"];
+  data.paths.forEach((pts, i) => {
+    const d = pts.map((p, j) => `${j === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+    paths += `<path d="${d}" fill="none" stroke="${colors[i % colors.length]}" stroke-width="0.6"/>`;
+  });
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${paths}</svg>`;
+}
+
+function truchetToSVG(data, w, h, color) {
+  let defs = `<defs>`;
+  const s = data.tiles[0]?.size || 30;
+  defs += `<g id="t-qc"><path d="M0 0 A${s} ${s} 0 0 1 ${s} ${s}" fill="none" stroke="${color}" stroke-width="1.5"/><path d="M${s} 0 A${s} ${s} 0 0 0 0 ${s}" fill="none" stroke="${color}" stroke-width="1.5"/></g>`;
+  defs += `<g id="t-diag"><line x1="0" y1="0" x2="${s}" y2="${s}" stroke="${color}" stroke-width="1.5"/></g>`;
+  defs += `</defs>`;
+  let uses = "";
+  for (const t of data.tiles) {
+    const id = t.style === "quarter-circle" ? "t-qc" : "t-diag";
+    uses += `<use href="#${id}" x="${t.x}" y="${t.y}" transform="rotate(${t.rotation},${t.x + s/2},${t.y + s/2})"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${defs}${uses}</svg>`;
+}
+
+function lissajousToSVG(data, w, h, color) {
+  const d = data.points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/><path d="${d}" fill="none" stroke="${color}" stroke-width="1.2" stroke-linecap="round"/></svg>`;
+}
+
+function moireToSVG(data, color) {
+  const { w, h, spacing1, spacing2, angle1, angle2 } = data;
+  let lines = "";
+  const diag = Math.sqrt(w*w + h*h);
+  const count = Math.ceil(diag / Math.min(spacing1, spacing2)) + 10;
+  for (let i = -count; i < count; i++) {
+    const cos1 = Math.cos(angle1*Math.PI/180), sin1 = Math.sin(angle1*Math.PI/180);
+    const offset1 = i * spacing1;
+    lines += `<line x1="${(-diag/2*cos1 - offset1*sin1 + w/2).toFixed(1)}" y1="${(-diag/2*sin1 + offset1*cos1 + h/2).toFixed(1)}" x2="${(diag/2*cos1 - offset1*sin1 + w/2).toFixed(1)}" y2="${(diag/2*sin1 + offset1*cos1 + h/2).toFixed(1)}" stroke="${color}" stroke-width="0.8" opacity="0.6"/>`;
+    const cos2 = Math.cos(angle2*Math.PI/180), sin2 = Math.sin(angle2*Math.PI/180);
+    const offset2 = i * spacing2;
+    lines += `<line x1="${(-diag/2*cos2 - offset2*sin2 + w/2).toFixed(1)}" y1="${(-diag/2*sin2 + offset2*cos2 + h/2).toFixed(1)}" x2="${(diag/2*cos2 - offset2*sin2 + w/2).toFixed(1)}" y2="${(diag/2*sin2 + offset2*cos2 + h/2).toFixed(1)}" stroke="${color}" stroke-width="0.8" opacity="0.6"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"><rect width="${w}" height="${h}" fill="white"/>${lines}</svg>`;
+}
+
+
+// ── Effect definitions ──────────────────────────────
+
+const EFFECTS = [
+  { id: "halftone", name: "Halftone", cat: "Dot", needsImage: true, params: [
+    { key: "shape", label: "Dot shape", type: "select", options: ["circle","square","diamond","line","cross"], default: "circle" },
+    { key: "gridType", label: "Grid", type: "select", options: ["square","hex"], default: "square" },
+    { key: "spacing", label: "Spacing", type: "range", min: 4, max: 30, default: 10 },
+    { key: "maxSize", label: "Max dot", type: "range", min: 2, max: 15, default: 5, step: 0.5 },
+    { key: "angle", label: "Angle", type: "range", min: 0, max: 90, default: 0 },
+    { key: "invert", label: "Invert", type: "toggle", default: false },
+  ]},
+  { id: "stipple", name: "Stipple", cat: "Dot", needsImage: true, params: [
+    { key: "count", label: "Dot count", type: "range", min: 500, max: 8000, default: 3000, step: 100 },
+    { key: "dotSize", label: "Dot size", type: "range", min: 0.5, max: 4, default: 1.5, step: 0.1 },
+    { key: "relaxIterations", label: "Relax passes", type: "range", min: 0, max: 8, default: 3 },
+  ]},
+  { id: "concentric", name: "Concentric", cat: "Dot", needsImage: true, params: [
+    { key: "ringSpacing", label: "Ring spacing", type: "range", min: 3, max: 20, default: 6 },
+    { key: "maxStroke", label: "Max stroke", type: "range", min: 1, max: 8, default: 4, step: 0.5 },
+  ]},
+  { id: "floyd-steinberg", name: "Floyd-Steinberg", cat: "Dither", needsImage: true, params: [
+    { key: "pixelSize", label: "Pixel size", type: "range", min: 2, max: 12, default: 4 },
+    { key: "palette", label: "Palette", type: "select", options: ["1bit","4level"], default: "1bit" },
+  ]},
+  { id: "ordered", name: "Ordered (Bayer)", cat: "Dither", needsImage: true, params: [
+    { key: "pixelSize", label: "Pixel size", type: "range", min: 2, max: 12, default: 4 },
+  ]},
+  { id: "atkinson", name: "Atkinson", cat: "Dither", needsImage: true, params: [
+    { key: "pixelSize", label: "Pixel size", type: "range", min: 2, max: 12, default: 4 },
+    { key: "palette", label: "Palette", type: "select", options: ["1bit","4level"], default: "1bit" },
+  ]},
+  { id: "crosshatch", name: "Crosshatch", cat: "Line", needsImage: true, params: [
+    { key: "layers", label: "Layers", type: "range", min: 1, max: 4, default: 3 },
+    { key: "spacing", label: "Line spacing", type: "range", min: 3, max: 16, default: 6 },
+    { key: "strokeWidth", label: "Stroke", type: "range", min: 0.3, max: 3, default: 1, step: 0.1 },
+  ]},
+  { id: "ascii", name: "ASCII art", cat: "Text", needsImage: true, params: [
+    { key: "cellSize", label: "Cell size", type: "range", min: 4, max: 16, default: 8 },
+    { key: "charset", label: "Charset", type: "select", options: [" .:-=+*#%@"," ░▒▓█","  .:oO@#"," .,-~:;=!*#$@"], default: " .:-=+*#%@" },
+    { key: "invert", label: "Invert", type: "toggle", default: false },
+  ]},
+  { id: "scanlines", name: "Scanlines", cat: "CRT", needsImage: false, params: [
+    { key: "lineWidth", label: "Line width", type: "range", min: 1, max: 6, default: 2 },
+    { key: "gap", label: "Gap", type: "range", min: 1, max: 8, default: 2 },
+    { key: "opacity", label: "Opacity", type: "range", min: 0.1, max: 1, default: 0.5, step: 0.05 },
+    { key: "phosphor", label: "Phosphor mask", type: "toggle", default: false },
+  ]},
+  { id: "guilloche", name: "Guilloché", cat: "Generative", needsImage: false, params: [
+    { key: "majorR", label: "Major radius", type: "range", min: 30, max: 200, default: 100 },
+    { key: "minorR", label: "Minor radius", type: "range", min: 10, max: 120, default: 60 },
+    { key: "penOffset", label: "Pen offset", type: "range", min: 5, max: 100, default: 40 },
+    { key: "rotations", label: "Rotations", type: "range", min: 4, max: 60, default: 20 },
+    { key: "layers", label: "Layers", type: "range", min: 1, max: 5, default: 3 },
+  ]},
+  { id: "truchet", name: "Truchet tiles", cat: "Generative", needsImage: false, params: [
+    { key: "tileSize", label: "Tile size", type: "range", min: 10, max: 60, default: 30 },
+    { key: "style", label: "Style", type: "select", options: ["quarter-circle","diagonal"], default: "quarter-circle" },
+  ]},
+  { id: "lissajous", name: "Lissajous", cat: "Generative", needsImage: false, params: [
+    { key: "freqA", label: "Freq A", type: "range", min: 1, max: 12, default: 3 },
+    { key: "freqB", label: "Freq B", type: "range", min: 1, max: 12, default: 2 },
+    { key: "phase", label: "Phase", type: "range", min: 0, max: 360, default: 90 },
+    { key: "decay", label: "Decay", type: "range", min: 0, max: 3, default: 0, step: 0.1 },
+  ]},
+  { id: "moire", name: "Moiré", cat: "Generative", needsImage: false, params: [
+    { key: "spacing1", label: "Grid 1 spacing", type: "range", min: 3, max: 20, default: 8 },
+    { key: "spacing2", label: "Grid 2 spacing", type: "range", min: 3, max: 20, default: 9 },
+    { key: "angle1", label: "Grid 1 angle", type: "range", min: 0, max: 90, default: 0 },
+    { key: "angle2", label: "Grid 2 angle", type: "range", min: 0, max: 90, default: 5 },
+  ]},
+];
+
+const PRESETS = {
+  "Newspaper": { effect: "halftone", params: { shape: "circle", gridType: "square", spacing: 8, maxSize: 4, angle: 45, invert: false }},
+  "Pop art": { effect: "halftone", params: { shape: "circle", gridType: "hex", spacing: 14, maxSize: 7, angle: 0, invert: false }},
+  "Old Mac": { effect: "atkinson", params: { pixelSize: 3, palette: "1bit" }},
+  "Game Boy": { effect: "ordered", params: { pixelSize: 5 }},
+  "Engraving": { effect: "crosshatch", params: { layers: 4, spacing: 5, strokeWidth: 0.6 }},
+  "Terminal": { effect: "ascii", params: { cellSize: 6, charset: " .:-=+*#%@", invert: false }},
+  "Banknote": { effect: "guilloche", params: { majorR: 120, minorR: 70, penOffset: 50, rotations: 30, layers: 4 }},
+  "CRT monitor": { effect: "scanlines", params: { lineWidth: 2, gap: 1, opacity: 0.6, phosphor: true }},
+};
+
+
+// ── Main App ──────────────────────────────
+
+export default function App() {
+  const [image, setImage] = useState(null);
+  const [effect, setEffect] = useState("halftone");
+  const [params, setParams] = useState({});
+  const [color, setColor] = useState("#1a1a1a");
+  const [svgOutput, setSvgOutput] = useState("");
+  const [processing, setProcessing] = useState(false);
+  const [previewW] = useState(500);
+  const [previewH] = useState(500);
+  const canvasRef = useRef(null);
+  const fileRef = useRef(null);
+  const [activeTab, setActiveTab] = useState("effects");
+
+  const currentEffect = EFFECTS.find(e => e.id === effect);
+
+  useEffect(() => {
+    if (currentEffect) {
+      const defaults = {};
+      currentEffect.params.forEach(p => { defaults[p.key] = p.default; });
+      setParams(prev => ({ ...defaults, ...prev }));
+    }
+  }, [effect]);
+
+  const loadImage = useCallback((file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        setImage(img);
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const loadDemo = useCallback(() => {
+    const c = document.createElement("canvas");
+    c.width = previewW; c.height = previewH;
+    const ctx = c.getContext("2d");
+    const grad = ctx.createRadialGradient(previewW/2, previewH/2, 20, previewW/2, previewH/2, previewW/2);
+    grad.addColorStop(0, "#ffffff");
+    grad.addColorStop(0.5, "#888888");
+    grad.addColorStop(1, "#111111");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, previewW, previewH);
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 72px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Aa", previewW/2, previewH/2 + 24);
+    ctx.font = "24px sans-serif";
+    ctx.fillText("SVG TEXTURE LAB", previewW/2, previewH/2 + 64);
+    const img = new Image();
+    img.onload = () => setImage(img);
+    img.src = c.toDataURL();
+  }, [previewW, previewH]);
+
+  useEffect(() => { loadDemo(); }, [loadDemo]);
+
+  const generate = useCallback(() => {
+    if (!currentEffect) return;
+    setProcessing(true);
+
+    requestAnimationFrame(() => {
+      const c = canvasRef.current;
+      if (!c) { setProcessing(false); return; }
+      const ctx = c.getContext("2d");
+      const w = previewW, h = previewH;
+      c.width = w; c.height = h;
+
+      if (image && currentEffect.needsImage) {
+        const scale = Math.min(w / image.width, h / image.height);
+        const dw = image.width * scale, dh = image.height * scale;
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(image, (w - dw) / 2, (h - dh) / 2, dw, dh);
+      } else {
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, w, h);
+      }
+
+      let svg = "";
+      try {
+        switch (effect) {
+          case "halftone": svg = halftoneToSVG(halftone(ctx, w, h, params), w, h, color); break;
+          case "stipple": svg = stippleToSVG(stipple(ctx, w, h, params), w, h, color); break;
+          case "concentric": svg = concentricToSVG(concentricHalftone(ctx, w, h, params), w, h, color); break;
+          case "floyd-steinberg": svg = ditherToSVG(dither(ctx, w, h, { ...params, algorithm: "floyd-steinberg" }), w, h, color); break;
+          case "ordered": svg = ditherToSVG(dither(ctx, w, h, { ...params, algorithm: "ordered" }), w, h, color); break;
+          case "atkinson": svg = ditherToSVG(dither(ctx, w, h, { ...params, algorithm: "atkinson" }), w, h, color); break;
+          case "crosshatch": svg = crosshatchToSVG(crosshatch(ctx, w, h, params), w, h, color); break;
+          case "ascii": svg = asciiToSVG(ascii(ctx, w, h, params), w, h, color); break;
+          case "scanlines": svg = scanlinesToSVG(scanlines(ctx, w, h, params), color); break;
+          case "guilloche": svg = guillocheToSVG(guilloche(w, h, params), w, h, color); break;
+          case "truchet": svg = truchetToSVG(truchet(w, h, params), w, h, color); break;
+          case "lissajous": svg = lissajousToSVG(lissajous(w, h, params), w, h, color); break;
+          case "moire": svg = moireToSVG(moire(w, h, params), color); break;
+        }
+      } catch (err) { console.error(err); }
+
+      setSvgOutput(svg);
+      setProcessing(false);
+    });
+  }, [effect, params, color, image, currentEffect, previewW, previewH]);
+
+  useEffect(() => { generate(); }, [generate]);
+
+  const downloadSVG = () => {
+    if (!svgOutput) return;
+    const blob = new Blob([svgOutput], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${effect}-texture.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const applyPreset = (name) => {
+    const p = PRESETS[name];
+    if (p) {
+      setEffect(p.effect);
+      setParams(p.params);
+    }
+  };
+
+  const categories = [...new Set(EFFECTS.map(e => e.cat))];
+
+  return (
+    <div style={{ fontFamily: "'DM Sans', 'Helvetica Neue', sans-serif", maxWidth: 1100, margin: "0 auto", padding: "0 16px" }}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+
+      {/* Header */}
+      <div style={{ padding: "32px 0 24px", borderBottom: "1px solid #e5e3db" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.03em", color: "#1a1a17" }}>SVG Texture Lab</h1>
+          <span style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "#8a8880", letterSpacing: "0.05em" }}>v1.0</span>
+        </div>
+        <p style={{ fontSize: 14, color: "#6b6a63", marginTop: 6, maxWidth: 500 }}>
+          Generate textures, patterns & effects as pure SVG. Upload an image or use generative patterns.
+        </p>
+      </div>
+
+      {/* Main layout */}
+      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 24, marginTop: 24, alignItems: "start" }}>
+
+        {/* Left panel */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {/* Image upload */}
+          <div style={{ background: "#faf9f6", border: "1px solid #e5e3db", borderRadius: 12, padding: 16 }}>
+            <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>Source image</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => fileRef.current?.click()} style={{ flex: 1, padding: "8px 12px", fontSize: 13, fontWeight: 500, background: "#1a1a17", color: "#faf9f6", border: "none", borderRadius: 8, cursor: "pointer" }}>Upload image</button>
+              <button onClick={loadDemo} style={{ padding: "8px 12px", fontSize: 13, fontWeight: 500, background: "transparent", color: "#6b6a63", border: "1px solid #d5d3cb", borderRadius: 8, cursor: "pointer" }}>Demo</button>
+            </div>
+            <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => e.target.files[0] && loadImage(e.target.files[0])}/>
+          </div>
+
+          {/* Tabs */}
+          <div style={{ display: "flex", borderBottom: "1px solid #e5e3db" }}>
+            {["effects", "presets"].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} style={{
+                flex: 1, padding: "10px 0", fontSize: 12, fontWeight: 500, textTransform: "uppercase",
+                letterSpacing: "0.08em", fontFamily: "'DM Mono', monospace",
+                background: "none", border: "none", borderBottom: activeTab === tab ? "2px solid #1a1a17" : "2px solid transparent",
+                color: activeTab === tab ? "#1a1a17" : "#a5a49d", cursor: "pointer",
+              }}>{tab}</button>
+            ))}
+          </div>
+
+          {/* Effects list */}
+          {activeTab === "effects" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {categories.map(cat => (
+                <div key={cat}>
+                  <div style={{ fontSize: 10, fontFamily: "'DM Mono', monospace", color: "#a5a49d", textTransform: "uppercase", letterSpacing: "0.12em", padding: "8px 0 4px" }}>{cat}</div>
+                  {EFFECTS.filter(e => e.cat === cat).map(e => (
+                    <button key={e.id} onClick={() => setEffect(e.id)} style={{
+                      display: "block", width: "100%", textAlign: "left", padding: "8px 12px", fontSize: 13, fontWeight: effect === e.id ? 500 : 400,
+                      background: effect === e.id ? "#1a1a17" : "transparent", color: effect === e.id ? "#faf9f6" : "#3d3d3a",
+                      border: "none", borderRadius: 6, cursor: "pointer", marginBottom: 2, transition: "all .1s",
+                    }}>
+                      {e.name}
+                      {e.needsImage && <span style={{ fontSize: 10, opacity: 0.5, marginLeft: 6 }}>img</span>}
+                    </button>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Presets */}
+          {activeTab === "presets" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              {Object.keys(PRESETS).map(name => (
+                <button key={name} onClick={() => applyPreset(name)} style={{
+                  padding: "10px 12px", fontSize: 12, fontWeight: 500, background: "#faf9f6",
+                  border: "1px solid #e5e3db", borderRadius: 8, cursor: "pointer", color: "#3d3d3a",
+                  transition: "all .1s",
+                }}>{name}</button>
+              ))}
+            </div>
+          )}
+
+          {/* Parameters */}
+          {currentEffect && (
+            <div style={{ background: "#faf9f6", border: "1px solid #e5e3db", borderRadius: 12, padding: 16 }}>
+              <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>Parameters</div>
+              {currentEffect.params.map(p => (
+                <div key={p.key} style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <label style={{ fontSize: 12, color: "#6b6a63", fontWeight: 500 }}>{p.label}</label>
+                    {p.type === "range" && <span style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#a5a49d" }}>{params[p.key] ?? p.default}</span>}
+                  </div>
+                  {p.type === "range" && (
+                    <input type="range" min={p.min} max={p.max} step={p.step || 1} value={params[p.key] ?? p.default}
+                      onChange={e => setParams(prev => ({ ...prev, [p.key]: Number(e.target.value) }))}
+                      style={{ width: "100%", accentColor: "#1a1a17" }}/>
+                  )}
+                  {p.type === "select" && (
+                    <select value={params[p.key] ?? p.default}
+                      onChange={e => setParams(prev => ({ ...prev, [p.key]: e.target.value }))}
+                      style={{ width: "100%", padding: "6px 8px", fontSize: 12, border: "1px solid #d5d3cb", borderRadius: 6, background: "#fff", color: "#3d3d3a" }}>
+                      {p.options.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  )}
+                  {p.type === "toggle" && (
+                    <button onClick={() => setParams(prev => ({ ...prev, [p.key]: !(prev[p.key] ?? p.default) }))}
+                      style={{
+                        padding: "4px 12px", fontSize: 11, fontWeight: 500, borderRadius: 4,
+                        border: "1px solid #d5d3cb", cursor: "pointer",
+                        background: (params[p.key] ?? p.default) ? "#1a1a17" : "#fff",
+                        color: (params[p.key] ?? p.default) ? "#faf9f6" : "#6b6a63",
+                      }}>{(params[p.key] ?? p.default) ? "ON" : "OFF"}</button>
+                  )}
+                </div>
+              ))}
+
+              {/* Color picker */}
+              <div style={{ marginTop: 4 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <label style={{ fontSize: 12, color: "#6b6a63", fontWeight: 500 }}>Stroke color</label>
+                  <span style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#a5a49d" }}>{color}</span>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {["#1a1a17","#2d5a8e","#8e2d2d","#2d8e5a","#8e5a2d","#5a2d8e","#d4470a","#0a7b8e"].map(c => (
+                    <button key={c} onClick={() => setColor(c)} style={{
+                      width: 24, height: 24, borderRadius: 6, background: c, border: color === c ? "2px solid #1a1a17" : "1px solid #d5d3cb",
+                      cursor: "pointer", outline: color === c ? "2px solid #faf9f6" : "none",
+                    }}/>
+                  ))}
+                  <input type="color" value={color} onChange={e => setColor(e.target.value)} style={{ width: 24, height: 24, border: "none", padding: 0, cursor: "pointer", borderRadius: 4 }}/>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Right panel — Preview + Export */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {/* Preview */}
+          <div style={{ background: "#faf9f6", border: "1px solid #e5e3db", borderRadius: 12, padding: 16, position: "relative" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880", textTransform: "uppercase", letterSpacing: "0.1em" }}>Preview</div>
+              {processing && <div style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#d4470a" }}>Processing...</div>}
+            </div>
+
+            <div style={{
+              width: "100%", aspectRatio: "1", background: "#fff", borderRadius: 8, border: "1px solid #e5e3db",
+              overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center",
+            }}>
+              {svgOutput ? (
+                <div style={{ width: "100%", height: "100%" }} dangerouslySetInnerHTML={{ __html: svgOutput }}/>
+              ) : (
+                <div style={{ color: "#a5a49d", fontSize: 13 }}>Generate a pattern to preview</div>
+              )}
+            </div>
+
+            <canvas ref={canvasRef} style={{ display: "none" }} />
+          </div>
+
+          {/* Export buttons */}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={downloadSVG} disabled={!svgOutput} style={{
+              flex: 1, padding: "12px 16px", fontSize: 13, fontWeight: 600, letterSpacing: "0.02em",
+              background: svgOutput ? "#1a1a17" : "#d5d3cb", color: svgOutput ? "#faf9f6" : "#a5a49d",
+              border: "none", borderRadius: 8, cursor: svgOutput ? "pointer" : "default", transition: "all .15s",
+            }}>Download SVG</button>
+            <button onClick={() => { if (svgOutput) navigator.clipboard?.writeText(svgOutput); }} disabled={!svgOutput} style={{
+              padding: "12px 16px", fontSize: 13, fontWeight: 500,
+              background: "transparent", color: svgOutput ? "#3d3d3a" : "#a5a49d",
+              border: "1px solid #d5d3cb", borderRadius: 8, cursor: svgOutput ? "pointer" : "default",
+            }}>Copy SVG</button>
+          </div>
+
+          {/* SVG stats */}
+          {svgOutput && (
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ background: "#faf9f6", borderRadius: 8, padding: "8px 14px", fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880" }}>
+                {(svgOutput.length / 1024).toFixed(1)} KB
+              </div>
+              <div style={{ background: "#faf9f6", borderRadius: 8, padding: "8px 14px", fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880" }}>
+                {(svgOutput.match(/<(circle|rect|line|path|text|polygon|use) /g) || []).length} elements
+              </div>
+              <div style={{ background: "#faf9f6", borderRadius: 8, padding: "8px 14px", fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#8a8880" }}>
+                {previewW}×{previewH}px
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div style={{ padding: "24px 0", marginTop: 32, borderTop: "1px solid #e5e3db", fontSize: 11, fontFamily: "'DM Mono', monospace", color: "#a5a49d", display: "flex", justifyContent: "space-between" }}>
+        <span>13 effects / 8 presets / Pure SVG export</span>
+        <span>All patterns generated client-side</span>
+      </div>
+    </div>
+  );
+}
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
